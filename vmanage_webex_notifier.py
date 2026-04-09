@@ -61,9 +61,10 @@ class VManageClient:
         log.info("vManage login OK")
 
     def get_alarms(self, from_ts_ms: int, to_ts_ms: int) -> list[dict]:
-        """Fetch alarms in a time window."""
-        url = f"{self.base}/dataservice/alarms"
-        payload = {
+        """Fetch alarms in a time window. Tries multiple methods for compatibility."""
+
+        # ── Method 1: POST with query filter (vManage 20.x+) ──────────────
+        payload: dict = {
             "query": {
                 "condition": "AND",
                 "rules": [
@@ -75,18 +76,43 @@ class VManageClient:
         if SEVERITY_FILTER and SEVERITY_FILTER != [""]:
             payload["query"]["rules"].append({
                 "value": [s.lower() for s in SEVERITY_FILTER],
-                "field": "severity",
-                "type": "string",
-                "operator": "in",
+                "field": "severity", "type": "string", "operator": "in",
             })
-
         try:
-            resp = self.session.post(url, json=payload, timeout=20)
-            resp.raise_for_status()
-            return resp.json().get("data", [])
+            resp = self.session.post(f"{self.base}/dataservice/alarms", json=payload, timeout=20)
+            if resp.status_code == 200:
+                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
+            log.warning(f"POST /alarms {resp.status_code} — trying GET fallback")
         except Exception as e:
-            log.warning(f"get_alarms error: {e}")
-            return []
+            log.warning(f"POST /alarms error: {e} — trying GET fallback")
+
+        # ── Method 2: GET fallback ─────────────────────────────────────────
+        try:
+            resp = self.session.get(
+                f"{self.base}/dataservice/alarms",
+                params={"startTime": from_ts_ms, "endTime": to_ts_ms},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
+            log.warning(f"GET /alarms {resp.status_code} — trying /event fallback")
+        except Exception as e:
+            log.warning(f"GET /alarms error: {e} — trying /event fallback")
+
+        # ── Method 3: /dataservice/event (some older versions) ────────────
+        try:
+            resp = self.session.get(
+                f"{self.base}/dataservice/event",
+                params={"startTime": from_ts_ms, "endTime": to_ts_ms, "count": 100},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
+            log.warning(f"GET /event {resp.status_code}")
+        except Exception as e:
+            log.warning(f"GET /event error: {e}")
+
+        return []
 
 
 class WebexNotifier:
