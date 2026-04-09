@@ -61,9 +61,23 @@ class VManageClient:
         log.info("vManage login OK")
 
     def get_alarms(self, from_ts_ms: int, to_ts_ms: int) -> list[dict]:
-        """Fetch alarms in a time window. Tries multiple methods for compatibility."""
+        """Fetch alarms and filter by time window."""
 
-        # ── Method 1: POST with query filter (vManage 20.x+) ──────────────
+        # ── Method 1: GET (vManage returns recent alarms, we filter by time) ──
+        try:
+            resp = self.session.get(
+                f"{self.base}/dataservice/alarms",
+                params={"count": 100},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                return self._filter_alarms(data, from_ts_ms)
+            log.warning(f"GET /alarms {resp.status_code} — trying POST")
+        except Exception as e:
+            log.warning(f"GET /alarms error: {e} — trying POST")
+
+        # ── Method 2: POST with query (vManage 20.x+) ─────────────────────
         payload: dict = {
             "query": {
                 "condition": "AND",
@@ -73,46 +87,32 @@ class VManageClient:
                 ],
             }
         }
-        if SEVERITY_FILTER and SEVERITY_FILTER != [""]:
-            payload["query"]["rules"].append({
-                "value": [s.lower() for s in SEVERITY_FILTER],
-                "field": "severity", "type": "string", "operator": "in",
-            })
         try:
-            resp = self.session.post(f"{self.base}/dataservice/alarms", json=payload, timeout=20)
-            if resp.status_code == 200:
-                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
-            log.warning(f"POST /alarms {resp.status_code} — trying GET fallback")
-        except Exception as e:
-            log.warning(f"POST /alarms error: {e} — trying GET fallback")
-
-        # ── Method 2: GET fallback ─────────────────────────────────────────
-        try:
-            resp = self.session.get(
-                f"{self.base}/dataservice/alarms",
-                params={"startTime": from_ts_ms, "endTime": to_ts_ms},
-                timeout=20,
+            resp = self.session.post(
+                f"{self.base}/dataservice/alarms", json=payload, timeout=20
             )
             if resp.status_code == 200:
-                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
-            log.warning(f"GET /alarms {resp.status_code} — trying /event fallback")
+                return self._filter_alarms(resp.json().get("data", []), from_ts_ms)
+            log.warning(f"POST /alarms {resp.status_code}")
         except Exception as e:
-            log.warning(f"GET /alarms error: {e} — trying /event fallback")
-
-        # ── Method 3: /dataservice/event (some older versions) ────────────
-        try:
-            resp = self.session.get(
-                f"{self.base}/dataservice/event",
-                params={"startTime": from_ts_ms, "endTime": to_ts_ms, "count": 100},
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                return [a for a in resp.json().get("data", []) if a.get("entry_time", 0) >= from_ts_ms]
-            log.warning(f"GET /event {resp.status_code}")
-        except Exception as e:
-            log.warning(f"GET /event error: {e}")
+            log.warning(f"POST /alarms error: {e}")
 
         return []
+
+    def _filter_alarms(self, alarms: list, from_ts_ms: int) -> list:
+        """Filter by time window and severity."""
+        result = []
+        for a in alarms:
+            # entry_time 기준 필터
+            if a.get("entry_time", 0) < from_ts_ms:
+                continue
+            # severity 필터 (대소문자 무시)
+            if SEVERITY_FILTER and SEVERITY_FILTER != [""]:
+                sev = a.get("severity", "").lower()
+                if sev not in [s.lower() for s in SEVERITY_FILTER]:
+                    continue
+            result.append(a)
+        return result
 
 
 class WebexNotifier:
@@ -122,25 +122,36 @@ class WebexNotifier:
             "Content-Type": "application/json",
         }
 
-    def _build_text(self, alarm: dict) -> tuple[str, str]:
-        """Returns (plain_text, markdown_text) for the alarm."""
-        severity   = alarm.get("severity", "unknown").lower()
-        alarm_type = alarm.get("type", "unknown")
-        system_ip  = alarm.get("system_ip", "N/A")
-        host_name  = alarm.get("host_name", "N/A")
+    def _build_text(self, alarm: dict) -> str:
+        severity   = alarm.get("severity", "unknown")
+        alarm_type = alarm.get("type", alarm.get("rulename", "unknown"))
+        rule_disp  = alarm.get("rule_name_display", alarm_type)
         message    = alarm.get("message", "")
         ts_ms      = alarm.get("entry_time", 0)
         ts_str     = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        emoji      = SEVERITY_EMOJI.get(severity, "❓")
+        emoji      = SEVERITY_EMOJI.get(severity.lower(), "❓")
+
+        # 영향받는 디바이스 정보
+        devices = alarm.get("devices", [])
+        device_ips = ", ".join(d.get("system-ip", "") for d in devices) or "N/A"
+
+        # consumed_events에서 호스트명 추출
+        events = alarm.get("consumed_events", [])
+        hostnames = list({e.get("host-name", "") for e in events if e.get("host-name")})
+        host_str = ", ".join(hostnames) or "N/A"
+
+        # site_id
+        site_id = alarm.get("site_id", alarm.get("values_short_display", [{}])[0].get("site-id", "N/A") if alarm.get("values_short_display") else "N/A")
 
         md = (
-            f"{emoji} **[{severity.upper()}] vManage Alarm**\n"
-            f"- **Type:** {alarm_type}\n"
-            f"- **Device:** {host_name} ({system_ip})\n"
+            f"{emoji} **[{severity.upper()}] {rule_disp}**\n"
+            f"- **Message:** {message}\n"
+            f"- **Site ID:** {site_id}\n"
+            f"- **Device(s):** {host_str} ({device_ips})\n"
             f"- **Time:** {ts_str}\n"
-            f"- **Message:** {message}"
+            f"- **Active:** {alarm.get('active', 'N/A')}"
         )
-        return severity, alarm_type, host_name, md
+        return md
 
     def _post(self, payload: dict, label: str):
         try:
@@ -156,15 +167,15 @@ class WebexNotifier:
             log.error(f"Webex send failed → {label}: {e}")
 
     def send(self, alarm: dict):
-        severity, alarm_type, host_name, md = self._build_text(alarm)
-        label = f"[{severity}] {alarm_type} @ {host_name}"
+        md = self._build_text(alarm)
+        severity = alarm.get("severity", "unknown")
+        rule = alarm.get("rule_name_display", alarm.get("type", ""))
+        label = f"[{severity}] {rule}"
 
         if WEBEX_TO_EMAILS:
-            # 이메일 수신자 각각에게 DM 전송
             for email in WEBEX_TO_EMAILS:
                 self._post({"toPersonEmail": email, "markdown": md}, email)
         elif WEBEX_ROOM_ID:
-            # fallback: Room 전송
             self._post({"roomId": WEBEX_ROOM_ID, "markdown": md}, WEBEX_ROOM_ID)
         else:
             log.warning("WEBEX_TO_EMAILS / WEBEX_ROOM_ID 미설정 — 알람 전송 생략")
