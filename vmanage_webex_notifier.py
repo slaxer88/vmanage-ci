@@ -9,7 +9,7 @@ import time
 import json
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -150,7 +150,8 @@ class WebexNotifier:
         rule_disp  = alarm.get("rule_name_display", alarm_type)
         message    = alarm.get("message", "")
         ts_ms      = alarm.get("entry_time", 0)
-        ts_str     = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        KST        = timezone(timedelta(hours=9))
+        ts_str     = datetime.fromtimestamp(ts_ms / 1000, tz=KST).strftime("%Y-%m-%d %H:%M:%S KST")
         emoji      = SEVERITY_EMOJI.get(severity.lower(), "❓")
 
         # 영향받는 디바이스 정보
