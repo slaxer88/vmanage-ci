@@ -26,8 +26,9 @@ WEBEX_TOKEN      = os.getenv("WEBEX_TOKEN", "")
 # 수신자: 이메일(쉼표 구분) 또는 Room ID 중 하나만 설정
 WEBEX_TO_EMAILS  = [e.strip() for e in os.getenv("WEBEX_TO_EMAILS", "").split(",") if e.strip()]
 WEBEX_ROOM_ID    = os.getenv("WEBEX_ROOM_ID", "")          # 이메일 미설정 시 fallback
-POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "60"))   # seconds
-SEVERITY_FILTER  = os.getenv("SEVERITY_FILTER", "").split(",")  # e.g. "critical,major"
+POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "60"))      # seconds
+SEVERITY_FILTER  = os.getenv("SEVERITY_FILTER", "").split(",") # e.g. "critical,major"
+LOOKBACK_MIN     = int(os.getenv("LOOKBACK_MIN", "30"))        # 시작 시 과거 N분치 알람 처리
 
 
 # ── Severity emoji map ───────────────────────────────────────────────────────
@@ -102,25 +103,36 @@ class VManageClient:
         return []
 
     def _filter_alarms(self, alarms: list, from_ts_ms: int) -> list:
-        """Filter by time window and severity."""
+        """Filter by time window and severity. Active alarms always pass."""
         log.info(f"Total alarms from API: {len(alarms)}")
         result = []
+        seen_ids = set()
         for a in alarms:
-            ts = a.get("entry_time", 0)
-            sev = a.get("severity", "")
-            rule = a.get("rule_name_display", a.get("type", ""))
-            log.debug(f"  alarm: {rule} [{sev}] entry_time={ts} (from={from_ts_ms}, diff={(ts-from_ts_ms)//1000}s)")
+            ts     = a.get("entry_time", 0)
+            sev    = a.get("severity", "")
+            rule   = a.get("rule_name_display", a.get("type", ""))
+            active = a.get("active", False)
+            uid    = a.get("uuid", a.get("id", ""))
 
-            # entry_time 기준 필터
-            if ts < from_ts_ms:
-                log.debug(f"  → skip (too old, {(from_ts_ms-ts)//1000}s ago)")
+            # 중복 방지
+            if uid and uid in seen_ids:
                 continue
+            if uid:
+                seen_ids.add(uid)
+
+            # active=true 알람은 시간 무관하게 항상 포함
+            time_ok = (ts >= from_ts_ms) or active
+            if not time_ok:
+                log.debug(f"  → skip (too old {(from_ts_ms-ts)//1000}s, active={active}): {rule}")
+                continue
+
             # severity 필터 (대소문자 무시)
             if SEVERITY_FILTER and SEVERITY_FILTER != [""]:
                 if sev.lower() not in [s.lower() for s in SEVERITY_FILTER]:
-                    log.debug(f"  → skip (severity {sev} not in filter)")
+                    log.debug(f"  → skip (severity {sev} not in filter): {rule}")
                     continue
-            log.info(f"  → MATCH: {rule} [{sev}] entry_time={ts}")
+
+            log.info(f"  → MATCH: {rule} [{sev}] active={active} entry_time={ts}")
             result.append(a)
         return result
 
@@ -196,8 +208,12 @@ def main():
     client   = VManageClient()
     notifier = WebexNotifier()
 
-    # Start from now
-    last_ts = int(time.time() * 1000)
+    # 시작 시 과거 LOOKBACK_MIN 분치 알람부터 처리
+    last_ts  = int(time.time() * 1000) - (LOOKBACK_MIN * 60 * 1000)
+    log.info(f"Lookback: {LOOKBACK_MIN}min — checking alarms from {LOOKBACK_MIN}min ago")
+
+    # 이미 전송한 알람 UUID 추적 (재시작 시 중복 방지)
+    sent_ids: set = set()
 
     while True:
         time.sleep(POLL_INTERVAL)
@@ -205,10 +221,18 @@ def main():
         log.info(f"Polling alarms [{last_ts} → {now_ts}]")
 
         alarms = client.get_alarms(last_ts, now_ts)
-        if alarms:
-            log.info(f"Found {len(alarms)} alarm(s)")
-            for alarm in alarms:
+        new_alarms = [a for a in alarms if a.get("uuid", a.get("id", "")) not in sent_ids]
+
+        if new_alarms:
+            log.info(f"Found {len(new_alarms)} new alarm(s)")
+            for alarm in new_alarms:
                 notifier.send(alarm)
+                uid = alarm.get("uuid", alarm.get("id", ""))
+                if uid:
+                    sent_ids.add(uid)
+            # sent_ids 크기 제한 (메모리 관리)
+            if len(sent_ids) > 1000:
+                sent_ids = set(list(sent_ids)[-500:])
         else:
             log.info("No new alarms")
 
