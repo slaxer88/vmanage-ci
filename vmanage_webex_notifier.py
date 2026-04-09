@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+# urllib3 경고 숨기기
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -101,16 +103,24 @@ class VManageClient:
 
     def _filter_alarms(self, alarms: list, from_ts_ms: int) -> list:
         """Filter by time window and severity."""
+        log.info(f"Total alarms from API: {len(alarms)}")
         result = []
         for a in alarms:
+            ts = a.get("entry_time", 0)
+            sev = a.get("severity", "")
+            rule = a.get("rule_name_display", a.get("type", ""))
+            log.debug(f"  alarm: {rule} [{sev}] entry_time={ts} (from={from_ts_ms}, diff={(ts-from_ts_ms)//1000}s)")
+
             # entry_time 기준 필터
-            if a.get("entry_time", 0) < from_ts_ms:
+            if ts < from_ts_ms:
+                log.debug(f"  → skip (too old, {(from_ts_ms-ts)//1000}s ago)")
                 continue
             # severity 필터 (대소문자 무시)
             if SEVERITY_FILTER and SEVERITY_FILTER != [""]:
-                sev = a.get("severity", "").lower()
-                if sev not in [s.lower() for s in SEVERITY_FILTER]:
+                if sev.lower() not in [s.lower() for s in SEVERITY_FILTER]:
+                    log.debug(f"  → skip (severity {sev} not in filter)")
                     continue
+            log.info(f"  → MATCH: {rule} [{sev}] entry_time={ts}")
             result.append(a)
         return result
 
