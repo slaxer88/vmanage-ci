@@ -21,7 +21,9 @@ VMANAGE_HOST     = os.getenv("VMANAGE_HOST", "https://vmanage.example.com")
 VMANAGE_USER     = os.getenv("VMANAGE_USER", "admin")
 VMANAGE_PASS     = os.getenv("VMANAGE_PASS", "admin")
 WEBEX_TOKEN      = os.getenv("WEBEX_TOKEN", "")
-WEBEX_ROOM_ID    = os.getenv("WEBEX_ROOM_ID", "")
+# 수신자: 이메일(쉼표 구분) 또는 Room ID 중 하나만 설정
+WEBEX_TO_EMAILS  = [e.strip() for e in os.getenv("WEBEX_TO_EMAILS", "").split(",") if e.strip()]
+WEBEX_ROOM_ID    = os.getenv("WEBEX_ROOM_ID", "")          # 이메일 미설정 시 fallback
 POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "60"))   # seconds
 SEVERITY_FILTER  = os.getenv("SEVERITY_FILTER", "").split(",")  # e.g. "critical,major"
 
@@ -94,7 +96,8 @@ class WebexNotifier:
             "Content-Type": "application/json",
         }
 
-    def send(self, alarm: dict):
+    def _build_text(self, alarm: dict) -> tuple[str, str]:
+        """Returns (plain_text, markdown_text) for the alarm."""
         severity   = alarm.get("severity", "unknown").lower()
         alarm_type = alarm.get("type", "unknown")
         system_ip  = alarm.get("system_ip", "N/A")
@@ -104,15 +107,16 @@ class WebexNotifier:
         ts_str     = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         emoji      = SEVERITY_EMOJI.get(severity, "❓")
 
-        text = (
+        md = (
             f"{emoji} **[{severity.upper()}] vManage Alarm**\n"
             f"- **Type:** {alarm_type}\n"
             f"- **Device:** {host_name} ({system_ip})\n"
             f"- **Time:** {ts_str}\n"
             f"- **Message:** {message}"
         )
+        return severity, alarm_type, host_name, md
 
-        payload = {"roomId": WEBEX_ROOM_ID, "markdown": text}
+    def _post(self, payload: dict, label: str):
         try:
             resp = requests.post(
                 "https://webexapis.com/v1/messages",
@@ -121,9 +125,23 @@ class WebexNotifier:
                 timeout=10,
             )
             resp.raise_for_status()
-            log.info(f"Webex notified: [{severity}] {alarm_type} @ {host_name}")
+            log.info(f"Webex notified → {label}")
         except Exception as e:
-            log.error(f"Webex send failed: {e}")
+            log.error(f"Webex send failed → {label}: {e}")
+
+    def send(self, alarm: dict):
+        severity, alarm_type, host_name, md = self._build_text(alarm)
+        label = f"[{severity}] {alarm_type} @ {host_name}"
+
+        if WEBEX_TO_EMAILS:
+            # 이메일 수신자 각각에게 DM 전송
+            for email in WEBEX_TO_EMAILS:
+                self._post({"toPersonEmail": email, "markdown": md}, email)
+        elif WEBEX_ROOM_ID:
+            # fallback: Room 전송
+            self._post({"roomId": WEBEX_ROOM_ID, "markdown": md}, WEBEX_ROOM_ID)
+        else:
+            log.warning("WEBEX_TO_EMAILS / WEBEX_ROOM_ID 미설정 — 알람 전송 생략")
 
 
 def main():
